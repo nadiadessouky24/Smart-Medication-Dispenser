@@ -124,7 +124,47 @@ Data showing how well the project met its initial objectives (e.g., "Response ti
 
 ## 7.1 Division of Labor:
 
-A clear breakdown of who worked on what (professors usually require this to grade individual contributions).
+For the first milestone, it was a collaberative effort. We brain stormed ideas together to find the one we will use. In addition to that, we worked on editing the wiki and creating the presentation together.
+
+In future milestones we image the work division might look something like this:
+
+**For milestone 3:**
+
+Nour:
+Servo PWM driver,
+LCD UART driver,
+Buzzer + LED driver, and
+UART event logging
+
+Nadia:
+RTC I2C driver,
+IR sensor ADC driver,
+Keypad scan + UI, and
+EEPROM persistence
+
+**Checkpoint B:**
+
+Nadia:
+Build pill wheel,
+Main loop integration, and
+End-to-end integration testing
+
+Nour:
+Dose scheduler,
+Alert state machine, and
+End-to-end integration testing
+
+**Milestone 4:**
+
+Both of us:
+Physical enclosure,
+Edge-case testing,
+10–12 min presentation,
+Full live demo,
+Clean codebase,
+Final report,
+GitHub wiki page, and
+Demo video
 
 ## 7.2 Timeline:
 
@@ -134,7 +174,7 @@ A clear breakdown of who worked on what (professors usually require this to grad
 
 ## 8.1 Source Code Repository:
 
-Link to your GitHub/GitLab repo.
+[Smart-Medical-Dispenser-Github-Link](https://github.com/nadiadessouky24/Smart-Medication-Dispenser)
 
 ## 8.2 References:
 
