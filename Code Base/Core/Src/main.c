@@ -38,15 +38,25 @@
 #define LCD_ROW1_OFFSET     0x40
 
 // Servo positions (pulse width in microseconds)
+// NARROW-RANGE CALIBRATED VALUES for this specific SG90 (range 500-1050us)
 #define SERVO_COMP_0    500
-#define SERVO_COMP_1    1000
-#define SERVO_COMP_2    1500
-#define SERVO_COMP_3    2000
+#define SERVO_COMP_1    683
+#define SERVO_COMP_2    866
+#define SERVO_COMP_3    1050
 
-// Dose acknowledgment timeout — 30 seconds
-#define ACK_TIMEOUT_MS  30000
+// IR sensor threshold â€” LOW = pill present (TCRT5000 analog output)
+// Calibrate by checking "IR on boot" value in TeraTerm
+#define IR_THRESHOLD    2000
+
+// Timeouts
+#define ACK_TIMEOUT_MS        30000
+#define ACK_AFTER_SWITCH_MS   30000
 
 #define MAX_DOSES       4
+
+// Flash storage â€” last page of STM32L432KC flash (page 127)
+#define FLASH_SCHEDULE_ADDR  0x0803F800
+#define FLASH_MAGIC          0xDEADBEEF
 /* USER CODE END PD */
 
 /* Private variables ---------------------------------------------------------*/
@@ -76,8 +86,10 @@ volatile uint8_t numDoses = 0;
 char btCmdBuf[64];
 volatile uint8_t btCmdIdx = 0;
 
-// Tracks whether we already triggered for the current minute
 uint8_t doseTriggeredThisMinute = 0;
+
+// Tracks which compartment the servo will rotate to next
+volatile uint8_t currentCompartment = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -103,13 +115,16 @@ void LCD_SetCursor(uint8_t row, uint8_t col);
 void LCD_Print(const char *str);
 void LCD_PrintLine(uint8_t row, const char *str);
 void Servo_SetCompartment(uint8_t compartment);
+void Servo_RotateToNext(void);
 uint16_t IR_Read(void);
+uint8_t Pill_Present(void);
 void Buzzer_On(void);
 void Buzzer_Off(void);
-void LED_On(void);
-void LED_Off(void);
+uint8_t Switch_IsLow(void);
 void RTC_SetTime(uint8_t hours, uint8_t minutes, uint8_t seconds);
 void RTC_GetTime(uint8_t *hours, uint8_t *minutes, uint8_t *seconds);
+void Flash_SaveSchedule(void);
+void Flash_LoadSchedule(void);
 void AdvanceToNextDose(void);
 void HandleDoseCycle(void);
 void BT_ProcessCommand(char *cmd);
@@ -200,21 +215,16 @@ void LCD_PrintLine(uint8_t row, const char *str) {
 }
 
 // ============================================================
-// LED (PA4)
+// Buzzer (PA4 â€” active buzzer, GPIO HIGH = on)
 // ============================================================
-void LED_On(void)  { HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET); }
-void LED_Off(void) { HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET); }
+void Buzzer_On(void)  { HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET); }
+void Buzzer_Off(void) { HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET); }
 
 // ============================================================
-// Buzzer (TIM2 CH2 on PA1)
+// Switch (PA8 â€” SPDT, LOW = switched toward GND)
 // ============================================================
-void Buzzer_On(void) {
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
-
-}
-void Buzzer_Off(void) {
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+uint8_t Switch_IsLow(void) {
+    return (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_RESET) ? 1 : 0;
 }
 
 // ============================================================
@@ -228,7 +238,29 @@ void Servo_SetCompartment(uint8_t comp) {
 }
 
 // ============================================================
+// Servo rotate to next compartment â€” uses stop/restart pattern
+// to force PWM output reload inside FreeRTOS task context.
+// Uses narrow-range calibrated pulses (500-1050us) for this servo.
+// ============================================================
+void Servo_RotateToNext(void) {
+    uint16_t pulses[4] = {SERVO_COMP_0, SERVO_COMP_1, SERVO_COMP_2, SERVO_COMP_3};
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Servo -> compartment %d (pulse=%u)\r\n",
+             currentCompartment, pulses[currentCompartment]);
+    UART2_Print(buf);
+
+    HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulses[currentCompartment]);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+    osDelay(1500);
+
+    currentCompartment = (currentCompartment + 1) % 4;
+}
+
+// ============================================================
 // IR Sensor (ADC1 CH8 on PA3)
+// TCRT5000: LOW analog output = pill present (green LED on)
 // ============================================================
 uint16_t IR_Read(void) {
     HAL_ADC_Start(&hadc1);
@@ -236,6 +268,10 @@ uint16_t IR_Read(void) {
     uint16_t val = HAL_ADC_GetValue(&hadc1);
     HAL_ADC_Stop(&hadc1);
     return val;
+}
+
+uint8_t Pill_Present(void) {
+    return (IR_Read() < IR_THRESHOLD) ? 1 : 0;  // LOW = pill present
 }
 
 // ============================================================
@@ -248,7 +284,7 @@ void RTC_SetTime(uint8_t hours, uint8_t minutes, uint8_t seconds) {
     data[2] = ((hours   / 10) << 4) | (hours   % 10);
     HAL_I2C_Mem_Write(&hi2c1, RTC_ADDR, RTC_TIME_REG,
                       I2C_MEMADD_SIZE_8BIT, data, 3, HAL_MAX_DELAY);
-    UART2_Print("RTC time set to 08:00:00\r\n");
+    UART2_Print("RTC time set.\r\n");
 }
 
 void RTC_GetTime(uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
@@ -261,6 +297,78 @@ void RTC_GetTime(uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
 }
 
 // ============================================================
+// Flash storage â€” save/load dose schedule to last flash page
+// STM32L432KC: page 127 at 0x0803F800
+// ============================================================
+void Flash_SaveSchedule(void) {
+    HAL_FLASH_Unlock();
+
+    // Erase page 127
+    FLASH_EraseInitTypeDef eraseInit;
+    uint32_t pageError;
+    eraseInit.TypeErase = FLASH_TYPEERASE_PAGES;
+    eraseInit.Page = 127;
+    eraseInit.NbPages = 1;
+    HAL_FLASHEx_Erase(&eraseInit, &pageError);
+
+    // Write magic number (validates data on next boot)
+    uint64_t magic = FLASH_MAGIC;
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                      FLASH_SCHEDULE_ADDR, magic);
+
+    // Write number of doses
+    uint64_t nDoses = numDoses;
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                      FLASH_SCHEDULE_ADDR + 8, nDoses);
+
+    // Write each dose (hour and minute packed into 64 bits)
+    for (int i = 0; i < numDoses; i++) {
+        uint64_t dose = ((uint64_t)doseSchedule[i].hour << 8) |
+                         (uint64_t)doseSchedule[i].minute;
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                          FLASH_SCHEDULE_ADDR + 16 + (i * 8), dose);
+    }
+
+    HAL_FLASH_Lock();
+    UART2_Print("Schedule saved to flash.\r\n");
+}
+
+void Flash_LoadSchedule(void) {
+    // Check magic number
+    uint32_t magic = *(uint32_t *)FLASH_SCHEDULE_ADDR;
+
+    if (magic != FLASH_MAGIC) {
+        UART2_Print("No saved schedule in flash.\r\n");
+        return;
+    }
+
+    // Read number of doses
+    uint32_t n = *(uint32_t *)(FLASH_SCHEDULE_ADDR + 8);
+    if (n > MAX_DOSES) {
+        UART2_Print("Invalid flash data â€” skipping.\r\n");
+        return;
+    }
+    numDoses = n;
+
+    // Read each dose
+    for (int i = 0; i < numDoses; i++) {
+        uint64_t dose = *(uint64_t *)(FLASH_SCHEDULE_ADDR + 16 + (i * 8));
+        doseSchedule[i].hour   = (dose >> 8) & 0xFF;
+        doseSchedule[i].minute = dose & 0xFF;
+        doseSchedule[i].active = 1;
+    }
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Loaded %d dose(s) from flash:\r\n", numDoses);
+    UART2_Print(buf);
+    for (int i = 0; i < numDoses; i++) {
+        snprintf(buf, sizeof(buf), "  Dose %d: %02d:%02d\r\n",
+                 i+1, doseSchedule[i].hour, doseSchedule[i].minute);
+        UART2_Print(buf);
+    }
+}
+
+// ============================================================
 // Advance to next dose
 // ============================================================
 void AdvanceToNextDose(void) {
@@ -269,6 +377,9 @@ void AdvanceToNextDose(void) {
             doseSchedule[i] = doseSchedule[i + 1];
         }
         numDoses--;
+
+        // Save updated schedule to flash
+        Flash_SaveSchedule();
 
         if (numDoses > 0) {
             char buf[40];
@@ -287,70 +398,109 @@ void AdvanceToNextDose(void) {
 }
 
 // ============================================================
-// Handle dose cycle:
-// 1. Buzzer + LED on
-// 2. Wait for switch LOW (dose taken) or 30s timeout (missed)
-// 3. Buzzer + LED off
-// 4. Log result, advance to next dose
+// Handle dose cycle
 // ============================================================
 void HandleDoseCycle(void) {
-    char buf[48];
+    char buf[64];
 
     snprintf(buf, sizeof(buf), "ALARM: Dose due at %02d:%02d\r\n",
              doseSchedule[0].hour, doseSchedule[0].minute);
     UART2_Print(buf);
 
-    // Alert user
-    LCD_PrintLine(0, "** DOSE DUE **");
-    LCD_PrintLine(1, "Slide switch!");
-    Buzzer_On();
-    LED_On();
+    // ---- Rotate servo to next compartment ----
+    Servo_RotateToNext();
 
-    // Wait for switch LOW (PA8) or 30s timeout
+    // ---- PHASE 1: Buzzer on, wait for pill removal or switch ----
+    LCD_PrintLine(0, "** DOSE DUE **");
+    LCD_PrintLine(1, "Pill present");
+    Buzzer_On();
+
     uint32_t startTime = HAL_GetTick();
-    uint8_t switchActivated = 0;
+    uint8_t pillTaken = 0;
+    uint8_t switchAcknowledged = 0;
 
     while (HAL_GetTick() - startTime < ACK_TIMEOUT_MS) {
-        if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_RESET) {
-            switchActivated = 1;
+        if (!Pill_Present()) {
+            pillTaken = 1;
             break;
         }
+        if (Switch_IsLow()) {
+            switchAcknowledged = 1;
+            break;
+        }
+        osDelay(200);
     }
 
-    // Stop buzzer and LED
-    Buzzer_Off();
-    LED_Off();
-
-    if (switchActivated) {
+    if (pillTaken) {
+        // Pill removed directly
+        Buzzer_Off();
         snprintf(buf, sizeof(buf), "Dose TAKEN at %02d:%02d\r\n",
                  doseSchedule[0].hour, doseSchedule[0].minute);
         UART2_Print(buf);
         LCD_PrintLine(0, "Dose taken!");
-        LCD_PrintLine(1, "Slide back HIGH");
-        HAL_Delay(3000);
+        LCD_PrintLine(1, "");
+        osDelay(3000);
+        AdvanceToNextDose();
+        doseTriggeredThisMinute = 1;
+        return;
+    }
 
-        // Wait for switch to go back HIGH
-        while (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_RESET) {}
-        UART2_Print("Switch reset. Ready for next dose.\r\n");
-
-    } else {
+    if (!switchAcknowledged) {
+        // 30s timeout â€” missed
+        Buzzer_Off();
         snprintf(buf, sizeof(buf), "Dose MISSED at %02d:%02d\r\n",
                  doseSchedule[0].hour, doseSchedule[0].minute);
         UART2_Print(buf);
         LCD_PrintLine(0, "Dose MISSED!");
         LCD_PrintLine(1, "");
-        HAL_Delay(3000);
+        osDelay(3000);
+        AdvanceToNextDose();
+        doseTriggeredThisMinute = 1;
+        return;
     }
 
-    // Advance to next dose
-    AdvanceToNextDose();
+    // ---- PHASE 2: Switch acknowledged, pill still present ----
+    Buzzer_Off();
+    UART2_Print("Acknowledged - pill still present. Waiting 30s...\r\n");
+    LCD_PrintLine(0, "Acknowledged");
+    LCD_PrintLine(1, "Take pill now!");
 
-    // Reset trigger flag so we don't fire again this minute
+    // Wait for switch to go back HIGH
+    while (Switch_IsLow()) { osDelay(50); }
+
+    // Wait up to 30s for pill removal
+    startTime = HAL_GetTick();
+    pillTaken = 0;
+
+    while (HAL_GetTick() - startTime < ACK_AFTER_SWITCH_MS) {
+        if (!Pill_Present()) {
+            pillTaken = 1;
+            break;
+        }
+        osDelay(200);
+    }
+
+    if (pillTaken) {
+        snprintf(buf, sizeof(buf), "Dose TAKEN at %02d:%02d (after ack)\r\n",
+                 doseSchedule[0].hour, doseSchedule[0].minute);
+        UART2_Print(buf);
+        LCD_PrintLine(0, "Dose taken!");
+        LCD_PrintLine(1, "");
+    } else {
+        snprintf(buf, sizeof(buf), "Dose MISSED at %02d:%02d (after ack)\r\n",
+                 doseSchedule[0].hour, doseSchedule[0].minute);
+        UART2_Print(buf);
+        LCD_PrintLine(0, "Dose MISSED!");
+        LCD_PrintLine(1, "");
+    }
+
+    osDelay(3000);
+    AdvanceToNextDose();
     doseTriggeredThisMinute = 1;
 }
 
 // ============================================================
-// Bluetooth command parser — "SET 08:00 13:00 18:00 22:00"
+// Bluetooth command parser â€” "SET 08:00 13:00 18:00 22:00"
 // ============================================================
 void BT_ProcessCommand(char *cmd) {
     char buf[64];
@@ -383,6 +533,9 @@ void BT_ProcessCommand(char *cmd) {
             UART2_Print(buf);
         }
 
+        // Save to flash so schedule survives power cycles
+        Flash_SaveSchedule();
+
         if (numDoses > 0) {
             snprintf(lcdBuf, sizeof(lcdBuf), "Next: %02d:%02d",
                      doseSchedule[0].hour, doseSchedule[0].minute);
@@ -390,8 +543,6 @@ void BT_ProcessCommand(char *cmd) {
             snprintf(lcdBuf, sizeof(lcdBuf), "No doses set");
         }
         LCD_PrintLine(1, lcdBuf);
-
-        // Reset trigger flag when new schedule is set
         doseTriggeredThisMinute = 0;
 
     } else {
@@ -423,18 +574,44 @@ int main(void)
 
   LCD_Init();
   LCD_PrintLine(0, "Med Dispenser");
-  LCD_PrintLine(1, "No doses set");
+  LCD_PrintLine(1, "Loading...");
 
-  RTC_SetTime(8, 0, 0);
-	
-	// Switch state on boot
-if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_RESET) {
-    UART2_Print("WARNING: Switch is LOW on boot! Slide it to HIGH first.\r\n");
-} else {
-    UART2_Print("Switch is HIGH. Ready.\r\n");
-}
+  // Uncomment once to set time, then comment out again
+ // RTC_SetTime(17, 19, 0);
 
+  // Load saved schedule from flash
+  Flash_LoadSchedule();
 
+  // Update LCD with loaded schedule
+  if (numDoses > 0) {
+      char lcdBuf[17];
+      snprintf(lcdBuf, sizeof(lcdBuf), "Next: %02d:%02d",
+               doseSchedule[0].hour, doseSchedule[0].minute);
+      LCD_PrintLine(1, lcdBuf);
+  } else {
+      LCD_PrintLine(1, "No doses set");
+  }
+
+  // Switch and IR boot check
+  if (Switch_IsLow()) {
+      UART2_Print("WARNING: Switch is LOW on boot!\r\n");
+  } else {
+      UART2_Print("Switch is HIGH. Ready.\r\n");
+  }
+
+  char irBuf[32];
+  snprintf(irBuf, sizeof(irBuf), "IR on boot: %d\r\n", IR_Read());
+  UART2_Print(irBuf);
+
+  UART2_Print("Send 'SET HH:MM HH:MM ...' from Arduino Blue.\r\n\r\n");
+
+  // ---- Home servo to compartment 0 at boot ----
+  UART2_Print("Homing servo to compartment 0...\r\n");
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, SERVO_COMP_0);
+  HAL_Delay(1500);
+  currentCompartment = 1;  // next rotation will go to compartment 1
+  UART2_Print("Servo homed.\r\n");
   /* USER CODE END 2 */
 
   osKernelInitialize();
@@ -473,7 +650,7 @@ void StartDefaultTask(void *argument)
           }
       }
 
-      // ---- Check time and trigger dose every 5 seconds ----
+      // ---- Check time every 5 seconds ----
       uint32_t now = HAL_GetTick();
       if (now - lastUpdate >= 5000) {
           lastUpdate = now;
@@ -481,16 +658,13 @@ void StartDefaultTask(void *argument)
           uint8_t h, m, s;
           RTC_GetTime(&h, &m, &s);
 
-          // Reset trigger flag when minute changes
           if (m != lastMinute) {
               lastMinute = m;
               doseTriggeredThisMinute = 0;
 
-              // Update LCD line 1 — current time
               snprintf(lcdLine1, sizeof(lcdLine1), "Time:  %02d:%02d", h, m);
               LCD_PrintLine(0, lcdLine1);
 
-              // Update LCD line 2 — next dose
               if (numDoses > 0) {
                   snprintf(lcdLine2, sizeof(lcdLine2), "Next: %02d:%02d",
                            doseSchedule[0].hour, doseSchedule[0].minute);
@@ -507,6 +681,8 @@ void StartDefaultTask(void *argument)
               }
           }
       }
+
+      osDelay(10);
   }
   /* USER CODE END 5 */
 }
@@ -656,26 +832,26 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
 
-  // PA4 — LED output
+  // PA4 â€” Active buzzer (GPIO HIGH = on)
   GPIO_InitStruct.Pin = GPIO_PIN_4;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  // PA8 — SPDT switch COM (input, pull-up, active LOW)
+  // PA8 â€” SPDT switch (input, pull-up, active LOW)
   GPIO_InitStruct.Pin = GPIO_PIN_8;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  // PB0 — RTC INT (kept as input but not used for interrupt anymore)
+  // PB0 â€” unused input
   GPIO_InitStruct.Pin = RTC_INT_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(RTC_INT_GPIO_Port, &GPIO_InitStruct);
 
-  // PB3 — Onboard LED
+  // PB3 â€” Onboard LED
   GPIO_InitStruct.Pin = LD3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
